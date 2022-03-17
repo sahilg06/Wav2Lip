@@ -1,4 +1,4 @@
-from os.path import dirname, join, basename, isfile
+from os.path import dirname, join, basename, isfile, isdir
 from tqdm import tqdm
 
 from models import SyncNet_color as SyncNet
@@ -42,7 +42,8 @@ syncnet_mel_step_size = 16
 
 class Dataset(object):
     def __init__(self, split):
-        self.all_videos = get_image_list(args.data_root, split)
+        #self.all_videos = get_image_list(args.data_root, split)
+        self.all_videos = [join(args.data_root, f) for f in os.listdir(args.data_root) if isdir(join(args.data_root, f))]
 
     def get_frame_id(self, frame):
         return int(basename(frame).split('.')[0])
@@ -413,8 +414,13 @@ if __name__ == "__main__":
     checkpoint_dir = args.checkpoint_dir
 
     # Dataset and Dataloader setup
-    train_dataset = Dataset('train')
-    test_dataset = Dataset('val')
+    # train_dataset = Dataset('train')
+    # test_dataset = Dataset('val')
+
+    full_dataset = Dataset('train')
+    train_size = int(0.95 * len(full_dataset))
+    test_size = len(full_dataset) - train_size
+    train_dataset, test_dataset = torch.utils.data.random_split(full_dataset, [train_size, test_size], generator=torch.Generator().manual_seed(42))
 
     train_data_loader = data_utils.DataLoader(
         train_dataset, batch_size=hparams.batch_size, shuffle=True,
@@ -451,7 +457,7 @@ if __name__ == "__main__":
     if not os.path.exists(checkpoint_dir):
         os.mkdir(checkpoint_dir)
     
-    writer = SummaryWriter('runs/full_model_with_disc_exp5')
+    writer = SummaryWriter('runs/full_model_crema-d_exp3')
 
     # Train!
     train(device, model, disc, train_data_loader, test_data_loader, optimizer, disc_optimizer,

@@ -1,8 +1,9 @@
-from os.path import dirname, join, basename, isfile
-from tqdm import tqdm
+from os.path import dirname, join, basename, isfile, isdir, splitext
+from tqdm.auto import tqdm
 
 from models import SyncNet_color as SyncNet
 from models import Wav2Lip as Wav2Lip
+from models import emo_disc
 import audio
 
 import torch
@@ -24,6 +25,7 @@ parser.add_argument("--data_root", help="Root folder of the preprocessed LRS2 da
 
 parser.add_argument('--checkpoint_dir', help='Save checkpoints to this directory', required=True, type=str)
 parser.add_argument('--syncnet_checkpoint_path', help='Load the pre-trained Expert discriminator', required=True, type=str)
+parser.add_argument('--emotion_disc_path', help='Load the pre-trained emotion discriminator', required=True, type=str)
 
 parser.add_argument('--checkpoint_path', help='Resume from this checkpoint', default=None, type=str)
 
@@ -32,15 +34,54 @@ args = parser.parse_args()
 
 global_step = 0
 global_epoch = 0
+os.environ['CUDA_VISIBLE_DEVICES']='4'
 use_cuda = torch.cuda.is_available()
 print('use_cuda: {}'.format(use_cuda))
 
 syncnet_T = 5
 syncnet_mel_step_size = 16
 
+def to_categorical(y, num_classes=None, dtype='float32'):
+
+    y = np.array(y, dtype='int')
+    input_shape = y.shape
+    if input_shape and input_shape[-1] == 1 and len(input_shape) > 1:
+        input_shape = tuple(input_shape[:-1])
+    y = y.ravel()
+    if not num_classes:
+        num_classes = np.max(y) + 1
+    n = y.shape[0]
+    categorical = np.zeros((n, num_classes), dtype=dtype)
+    categorical[np.arange(n), y] = 1
+    output_shape = input_shape + (num_classes,)
+    categorical = np.reshape(categorical, output_shape)
+    return categorical
+
+emotion_dict = {'ANG':0, 'DIS':1, 'FEA':2, 'HAP':3, 'NEU':4, 'SAD':5}
+intensity_dict = {'XX':0, 'LO':1, 'MD':2, 'HI':3}
+emonet_T = 5
+
 class Dataset(object):
-    def __init__(self, split):
-        self.all_videos = get_image_list(args.data_root, split)
+    def __init__(self, split, val=False):
+        #self.all_videos = get_image_list(args.data_root, split)
+        # self.all_videos = [join(args.data_root, f) for f in os.listdir(args.data_root) if isdir(join(args.data_root, f))]
+        self.filelist = []
+        self.all_videos = [f for f in os.listdir(args.data_root) if isdir(join(args.data_root, f))]
+
+        for filename in self.all_videos:
+            #print(splitext(filename))
+            labels = splitext(filename)[0].split('_')
+            emotion = emotion_dict[labels[2]]
+            
+            emotion_intensity = intensity_dict[labels[3]]
+            if val:
+                if emotion_intensity != 3:
+                    continue
+            
+            self.filelist.append((filename, emotion, emotion_intensity))
+
+        self.filelist = np.array(self.filelist)
+        print('Num files: ', len(self.filelist))
 
     def get_frame_id(self, frame):
         return int(basename(frame).split('.')[0])
@@ -111,9 +152,14 @@ class Dataset(object):
 
     def __getitem__(self, idx):
         while 1:
-            idx = random.randint(0, len(self.all_videos) - 1)
-            vidname = self.all_videos[idx]
-            img_names = list(glob(join(vidname, '*.jpg')))
+            idx = random.randint(0, len(self.filelist) - 1)
+            filename = self.filelist[idx]
+            vidname = filename[0]
+            emotion = int(filename[1])
+            emotion = to_categorical(emotion, num_classes=6)
+
+            img_names = list(glob(join(args.data_root, vidname, '*.jpg')))
+
             if len(img_names) <= 3 * syncnet_T:
                 continue
             
@@ -136,7 +182,7 @@ class Dataset(object):
                 continue
 
             try:
-                wavpath = join(vidname, "audio.wav")
+                wavpath = join(args.data_root, vidname, "audio.wav")
                 wav = audio.load_wav(wavpath, hparams.sample_rate)
 
                 orig_mel = audio.melspectrogram(wav).T
@@ -153,7 +199,9 @@ class Dataset(object):
 
             window = self.prepare_window(window)
             y = window.copy()
-            window[:, :, window.shape[2]//2:] = 0.
+            # window[:, :, window.shape[2]//2:] = 0.
+            # we need to generate whole face as we are incorporating emotion
+            window[:, :, :] = 0.
 
             wrong_window = self.prepare_window(wrong_window)
             x = np.concatenate([window, wrong_window], axis=0)
@@ -162,7 +210,7 @@ class Dataset(object):
             mel = torch.FloatTensor(mel.T).unsqueeze(0)
             indiv_mels = torch.FloatTensor(indiv_mels).unsqueeze(1)
             y = torch.FloatTensor(y)
-            return x, indiv_mels, mel, y
+            return x, indiv_mels, mel, y, emotion
 
 def save_sample_images(x, g, gt, global_step, checkpoint_dir):
     x = (x.detach().cpu().numpy().transpose(0, 2, 3, 4, 1) * 255.).astype(np.uint8)
@@ -184,10 +232,25 @@ def cosine_loss(a, v, y):
 
     return loss
 
+def freezeNet(network):
+    for p in network.parameters():
+        p.requires_grad = False
+
+def unfreezeNet(network):
+    for p in network.parameters():
+        p.requires_grad = True
+
 device = torch.device("cuda" if use_cuda else "cpu")
+device_ids = list(range(torch.cuda.device_count()))
+
 syncnet = SyncNet().to(device)
-for p in syncnet.parameters():
-    p.requires_grad = False
+# syncnet = nn.DataParallel(syncnet, device_ids)
+freezeNet(syncnet)
+
+disc_emo = emo_disc.DISCEMO().to(device)
+# disc_emo = nn.DataParallel(disc_emo, device_ids)
+disc_emo.load_state_dict(torch.load(args.emotion_disc_path))
+emo_loss_disc = nn.CrossEntropyLoss()
 
 recon_loss = nn.L1Loss()
 def get_sync_loss(mel, g):
@@ -203,106 +266,157 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
     print(f'num_batches:{len(train_data_loader)}')
     global global_step, global_epoch
     resumed_step = global_step
- 
     while global_epoch < nepochs:
         print('Starting Epoch: {}'.format(global_epoch))
         running_sync_loss, running_l1_loss = 0., 0.
+        running_loss_de_c = 0.0
+        # running_loss_de_c, running_emo_loss = 0., 0.
+        running_loss_fake_c, running_loss_real_c = 0., 0.
         prog_bar = tqdm(enumerate(train_data_loader))
-        for step, (x, indiv_mels, mel, gt) in prog_bar:
+        for step, (x, indiv_mels, mel, gt, emotion) in prog_bar:
             model.train()
+            disc_emo.train()
+            freezeNet(disc_emo)
             optimizer.zero_grad()
 
             # Move data to CUDA device
             x = x.to(device)
-            print(x.shape)
             mel = mel.to(device)
             indiv_mels = indiv_mels.to(device)
-            gt = gt.to(device)
+            gt = gt.to(device) 
+            emotion = emotion.to(device)
+            
 
-            g = model(indiv_mels, x)
-            print(g.shape)
-            break
+            #### training generator/Wav2lip model
+            g = model(indiv_mels, x, emotion) 
 
+            # emo_label is obtained from audio_encoding (not required for out model)
+
+            emotion_ = emotion.unsqueeze(1).repeat(1, 5, 1)
+            emotion_ = torch.cat([emotion_[:, i] for i in range(emotion_.size(1))], dim=0)
+
+            de_c = disc_emo.forward(g)
+            loss_de_c = emo_loss_disc(de_c, torch.argmax(emotion, dim=1)) # loss2
+            
             if hparams.syncnet_wt > 0.:
-                sync_loss = get_sync_loss(mel, g)
+                sync_loss = get_sync_loss(mel, g) # loss3
             else:
                 sync_loss = 0.
 
-            l1loss = recon_loss(g, gt)
+            l1loss = recon_loss(g, gt) # loss 4
 
-            loss = hparams.syncnet_wt * sync_loss + (1 - hparams.syncnet_wt) * l1loss
+            # loss = hparams.syncnet_wt * sync_loss + (1 - hparams.syncnet_wt - hparams.emo_wt) * l1loss + hparams.emo_wt * (loss_de_c + emo_loss)
+            loss = hparams.syncnet_wt * sync_loss + 0.9 * l1loss + (hparams.emo_wt * loss_de_c)
+
             loss.backward()
             optimizer.step()
 
-            if global_step % checkpoint_interval == 0:
+            unfreezeNet(disc_emo)
+            
+            if hparams.syncnet_wt > 0.:
+                running_sync_loss += sync_loss.item()
+            else:
+                running_sync_loss += 0.
+            running_l1_loss += l1loss.item()
+            running_loss_de_c += loss_de_c.item()
+            
+            #### training emotion_disc model
+            disc_emo.opt.zero_grad()
+            g = g.detach()
+            class_real = disc_emo(gt) # for ground-truth
+        
+            loss_real_c = emo_loss_disc(class_real, torch.argmax(emotion, dim=1))
+            loss_real_c.backward()
+            disc_emo.opt.step()
+
+            running_loss_real_c += loss_real_c.item()
+
+            if global_step == 1 or global_step % checkpoint_interval == 0:
                 save_sample_images(x, g, gt, global_step, checkpoint_dir)
 
             global_step += 1
             cur_session_steps = global_step - resumed_step
 
-            running_l1_loss += l1loss.item()
-            if hparams.syncnet_wt > 0.:
-                running_sync_loss += sync_loss.item()
-            else:
-                running_sync_loss += 0.
-
             if global_step == 1 or global_step % checkpoint_interval == 0:
-                save_checkpoint(
-                    model, optimizer, global_step, checkpoint_dir, global_epoch)
+                save_checkpoint(model, optimizer, global_step, checkpoint_dir, global_epoch)
+                save_checkpoint(disc_emo, disc_emo.opt, global_step,checkpoint_dir, global_epoch, prefix='disc_emo_')
 
             if global_step == 1 or global_step % hparams.eval_interval == 0:
                 with torch.no_grad():
                     average_sync_loss = eval_model(test_data_loader, global_step, device, model, checkpoint_dir)
 
                     if average_sync_loss < .75:
-                        hparams.set_hparam('syncnet_wt', 0.01) # without image GAN a lesser weight is sufficient
+                        hparams.set_hparam('syncnet_wt', 0.03) # without image GAN a lesser weight is sufficient
 
-            prog_bar.set_description('L1: {}, Sync Loss: {}'.format(running_l1_loss / (step + 1),
-                                                                    running_sync_loss / (step + 1)))
+            prog_bar.set_description('L1: {:.4f}, Sync Loss: {:.4f}, de_c_loss: {:.4f} | loss_real_c: {:.4f}'.format(running_l1_loss / (step + 1),
+                                                                    running_sync_loss / (step + 1),
+                                                                    running_loss_de_c / (step + 1),
+                                                                    running_loss_real_c / (step + 1)))
 
-        writer.add_scalar("Sync_Loss/train", running_sync_loss/len(train_data_loader), global_epoch)
-        writer.add_scalar("L1_Loss/train", running_l1_loss/len(train_data_loader), global_epoch)
+        writer.add_scalar("Sync_Loss/train_gen", running_sync_loss/len(train_data_loader), global_epoch)
+        writer.add_scalar("L1_Loss/train_gen", running_l1_loss/len(train_data_loader), global_epoch)
+        writer.add_scalar("Loss_de_c/train_gen", running_loss_de_c/len(train_data_loader), global_step)
+        writer.add_scalar("Loss_real_c/train_disc", running_loss_real_c/len(train_data_loader), global_step)
         global_epoch += 1
         
 
 def eval_model(test_data_loader, global_step, device, model, checkpoint_dir):
-    eval_steps = 700
-    print('Evaluating for {} steps'.format(eval_steps))
-    sync_losses, recon_losses = [], []
+    eval_steps = 50
+    print('\nEvaluating for {} steps'.format(eval_steps))
+    sync_losses, recon_losses, losses_de_c, emo_losses = [], [], [], []
+    losses_fake_c, losses_real_c = [], []
     step = 0
     while 1:
-        for x, indiv_mels, mel, gt in test_data_loader:
+        for x, indiv_mels, mel, gt, emotion in test_data_loader:
             step += 1
             model.eval()
+            disc_emo.eval()
 
             # Move data to CUDA device
             x = x.to(device)
             gt = gt.to(device)
             indiv_mels = indiv_mels.to(device)
             mel = mel.to(device)
+            emotion = emotion.to(device)
 
-            g = model(indiv_mels, x)
+            g = model(indiv_mels, x, emotion)
 
             sync_loss = get_sync_loss(mel, g)
             l1loss = recon_loss(g, gt)
 
+            de_c = disc_emo.forward(g)
+            emotion_ = emotion.unsqueeze(1).repeat(1, 5, 1)
+            emotion_ = torch.cat([emotion_[:, i] for i in range(emotion_.size(1))], dim=0)
+            loss_de_c = emo_loss_disc(de_c, torch.argmax(emotion, dim=1))
+
+            class_real = disc_emo(gt) # for ground-truth
+
+            loss_real_c = emo_loss_disc(class_real, torch.argmax(emotion, dim=1))
+
             sync_losses.append(sync_loss.item())
             recon_losses.append(l1loss.item())
+            losses_de_c.append(loss_de_c.item())
+            losses_real_c.append(loss_real_c.item())
 
             if step > eval_steps: 
                 averaged_sync_loss = sum(sync_losses) / len(sync_losses)
                 averaged_recon_loss = sum(recon_losses) / len(recon_losses)
+                averaged_loss_de_c = sum(losses_de_c) / len(losses_de_c)
+                averaged_loss_real_c = sum(losses_real_c) / len(losses_real_c)
 
-                print('L1: {}, Sync loss: {}'.format(averaged_recon_loss, averaged_sync_loss))
-                writer.add_scalar("Sync_Loss/val", averaged_sync_loss, global_step)
-                writer.add_scalar("L1_Loss/val", averaged_recon_loss, global_step)
+                print('L1: {:.4f}, Sync Loss: {:.4f}, de_c_loss: {:.4f} | loss_real_c: {:.4f}'.format(
+                    averaged_recon_loss, averaged_sync_loss, averaged_loss_de_c, averaged_loss_real_c))
+
+                writer.add_scalar("Sync_Loss/val_gen", averaged_sync_loss, global_step)
+                writer.add_scalar("L1_Loss/val_gen", averaged_recon_loss, global_step)
+                writer.add_scalar("Loss_de_c/val_gen", averaged_loss_de_c, global_step)
+                writer.add_scalar("Loss_real_c/val_disc", averaged_loss_real_c, global_step)
 
                 return averaged_sync_loss
 
-def save_checkpoint(model, optimizer, step, checkpoint_dir, epoch):
-
+def save_checkpoint(model, optimizer, step, checkpoint_dir, epoch, prefix=''):
     checkpoint_path = join(
-        checkpoint_dir, "checkpoint_step{:09d}.pth".format(global_step))
+        checkpoint_dir, "{}checkpoint_step{:09d}.pth".format(prefix, global_step))
     optimizer_state = optimizer.state_dict() if hparams.save_optimizer_state else None
     torch.save({
         "state_dict": model.state_dict(),
@@ -347,8 +461,13 @@ if __name__ == "__main__":
     checkpoint_dir = args.checkpoint_dir
 
     # Dataset and Dataloader setup
-    train_dataset = Dataset('train')
-    test_dataset = Dataset('val')
+    # train_dataset = Dataset('train')
+    # test_dataset = Dataset('val')
+
+    full_dataset = Dataset('train')
+    train_size = int(0.95 * len(full_dataset))
+    test_size = len(full_dataset) - train_size
+    train_dataset, test_dataset = torch.utils.data.random_split(full_dataset, [train_size, test_size], generator=torch.Generator().manual_seed(42))
 
     train_data_loader = data_utils.DataLoader(
         train_dataset, batch_size=hparams.batch_size, shuffle=True,
@@ -362,6 +481,7 @@ if __name__ == "__main__":
 
     # Model
     model = Wav2Lip().to(device)
+    # model = nn.DataParallel(model, device_ids)
     print('total trainable params {}'.format(sum(p.numel() for p in model.parameters() if p.requires_grad)))
 
     optimizer = optim.Adam([p for p in model.parameters() if p.requires_grad],
@@ -375,7 +495,7 @@ if __name__ == "__main__":
     if not os.path.exists(checkpoint_dir):
         os.mkdir(checkpoint_dir)
 
-    writer = SummaryWriter('runs/full_model_without_disc_exp_temp')
+    writer = SummaryWriter('runs_emo/exp2')
 
     # Train!
     train(device, model, train_data_loader, test_data_loader, optimizer,

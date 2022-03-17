@@ -7,6 +7,7 @@ from glob import glob
 import torch, face_detection
 from models import Wav2Lip
 import platform
+from datagen import to_categorical
 
 parser = argparse.ArgumentParser(description='Inference code to lip-sync videos in the wild using Wav2Lip models')
 
@@ -19,6 +20,8 @@ parser.add_argument('--audio', type=str,
 					help='Filepath of video/audio file to use as raw audio source', required=True)
 parser.add_argument('--outfile', type=str, help='Video path to save result. See default for an e.g.', 
 								default='results/result_voice.mp4')
+
+parser.add_argument('--emotion', type=str, required=True)
 
 parser.add_argument('--static', type=bool, 
 					help='If True, then use only first video frame for inference', default=False)
@@ -55,6 +58,9 @@ args.img_size = 96
 
 if os.path.isfile(args.face) and args.face.split('.')[1] in ['jpg', 'png', 'jpeg']:
 	args.static = True
+
+emotion_dict = {'ANG':0, 'DIS':1, 'FEA':2, 'HAP':3, 'NEU':4, 'SAD':5}
+emotion_dict_rev = dict((idxs, emos) for emos,idxs in emotion_dict.items())
 
 def get_smoothened_boxes(boxes, T):
 	for i in range(len(boxes)):
@@ -134,7 +140,8 @@ def datagen(frames, mels):
 			img_batch, mel_batch = np.asarray(img_batch), np.asarray(mel_batch)
 
 			img_masked = img_batch.copy()
-			img_masked[:, args.img_size//2:] = 0
+			#img_masked[:, args.img_size//2:] = 0
+			img_masked[:,:] = 0
 
 			img_batch = np.concatenate((img_masked, img_batch), axis=3) / 255.
 			mel_batch = np.reshape(mel_batch, [len(mel_batch), mel_batch.shape[1], mel_batch.shape[2], 1])
@@ -146,7 +153,8 @@ def datagen(frames, mels):
 		img_batch, mel_batch = np.asarray(img_batch), np.asarray(mel_batch)
 
 		img_masked = img_batch.copy()
-		img_masked[:, args.img_size//2:] = 0
+		# img_masked[:, args.img_size//2:] = 0
+		img_masked[:,:] = 0
 
 		img_batch = np.concatenate((img_masked, img_batch), axis=3) / 255.
 		mel_batch = np.reshape(mel_batch, [len(mel_batch), mel_batch.shape[1], mel_batch.shape[2], 1])
@@ -245,6 +253,11 @@ def main():
 
 	batch_size = args.wav2lip_batch_size
 	gen = datagen(full_frames.copy(), mel_chunks)
+    
+	emo = args.emotion
+	emotion = emotion_dict[emo]
+	emotion = to_categorical(emotion, num_classes=6)
+	emotion_ = torch.tensor(emotion).to(device)
 
 	for i, (img_batch, mel_batch, frames, coords) in enumerate(tqdm(gen, 
 											total=int(np.ceil(float(len(mel_chunks))/batch_size)))):
@@ -258,22 +271,27 @@ def main():
 
 		img_batch = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(device)
 		mel_batch = torch.FloatTensor(np.transpose(mel_batch, (0, 3, 1, 2))).to(device)
+		emotion = emotion_.unsqueeze(0).repeat(img_batch.shape[0], 1)
 
 		with torch.no_grad():
-			pred = model(mel_batch, img_batch)
+			pred = model(mel_batch, img_batch, emotion)
 
 		pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.
 		
+		idx=0
 		for p, f, c in zip(pred, frames, coords):
 			y1, y2, x1, x2 = c
 			p = cv2.resize(p.astype(np.uint8), (x2 - x1, y2 - y1))
 
 			f[y1:y2, x1:x2] = p
+			if not cv2.imwrite(f'results/{emo}/'+ str(idx) + '.jpg', f):
+				raise Exception("Could not write image")
+			idx = idx + 1
 			out.write(f)
 
 	out.release()
 
-	command = 'ffmpeg -y -i {} -i {} -strict -2 -q:v 1 {}'.format(args.audio, 'temp/result.avi', args.outfile)
+	command = 'ffmpeg -y -i {} -i {} -strict -2 -q:v 1 {}'.format(args.audio, 'temp/result.avi', f'results/{emo}.mp4')
 	subprocess.call(command, shell=platform.system() != 'Windows')
 
 if __name__ == '__main__':
