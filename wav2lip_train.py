@@ -16,6 +16,8 @@ import numpy as np
 from glob import glob
 
 import os, random, cv2, argparse
+import albumentations as A
+import utils
 from hparams import hparams, get_image_list
 
 parser = argparse.ArgumentParser(description='Code to train the Wav2Lip model without the visual quality discriminator')
@@ -41,6 +43,34 @@ syncnet_mel_step_size = 16
 class Dataset(object):
     def __init__(self, split):
         self.all_videos = get_image_list(args.data_root, split)
+
+        target = {}
+        for i in range(1, 2*syncnet_T):
+            target['image' + str(i)] = 'image'
+        
+        self.augments = A.Compose([
+                        A.RandomBrightnessContrast(p=0.2),    
+                        A.RandomGamma(p=0.2),    
+                        A.CLAHE(p=0.2),
+                        A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=50, val_shift_limit=50, p=0.2),  
+                        A.ChannelShuffle(p=0.2), 
+                        A.RGBShift(p=0.2),
+                        A.RandomBrightness(p=0.2),
+                        A.RandomContrast(p=0.2),
+                        A.GaussNoise(var_limit=(10.0, 50.0), p=0.2),
+                    ], additional_targets=target, p=0.6)
+
+    def augmentVideo(self, video):
+        args = {}
+        args['image'] = video[0, :, :, :]
+        for i in range(1, 2*syncnet_T):
+            args['image' + str(i)] = video[i, :, :, :]
+        result = self.augments(**args)
+        video[0, :, :, :] = result['image']
+        for i in range(1, 2*syncnet_T):
+            video[i, :, :, :] = result['image' + str(i)]
+        return video
+
 
     def get_frame_id(self, frame):
         return int(basename(frame).split('.')[0])
@@ -151,11 +181,25 @@ class Dataset(object):
             indiv_mels = self.get_segmented_mels(orig_mel.copy(), img_name)
             if indiv_mels is None: continue
 
-            window = self.prepare_window(window)
+            # window = self.prepare_window(window)
+            window = np.asarray(window)
             y = window.copy()
-            window[:, :, window.shape[2]//2:] = 0.
+            # window[:, :, window.shape[2]//2:] = 0.
+            # we need to generate whole face as we want to use its pretrained weights
+            window[:, :, :] = 0.
 
-            wrong_window = self.prepare_window(wrong_window)
+            # wrong_window = self.prepare_window(wrong_window)
+            wrong_window = np.asarray(wrong_window)
+            conact_for_aug = np.concatenate([y, wrong_window], axis=0)
+            # print(conact_for_aug.shape)
+
+            aug_results = self.augmentVideo(conact_for_aug)
+            y, wrong_window = np.split(aug_results, 2, axis=0)
+
+            y = np.transpose(y, (3, 0, 1, 2)) / 255
+            window = np.transpose(window, (3, 0, 1, 2))
+            wrong_window = np.transpose(wrong_window, (3, 0, 1, 2)) / 255
+
             x = np.concatenate([window, wrong_window], axis=0)
 
             x = torch.FloatTensor(x)
@@ -189,6 +233,7 @@ syncnet = SyncNet().to(device)
 for p in syncnet.parameters():
     p.requires_grad = False
 
+perceptual_loss = utils.perceptionLoss(device)
 recon_loss = nn.L1Loss()
 def get_sync_loss(mel, g):
     g = g[:, :, :, g.size(3)//2:]
@@ -206,7 +251,7 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
  
     while global_epoch < nepochs:
         print('Starting Epoch: {}'.format(global_epoch))
-        running_sync_loss, running_l1_loss = 0., 0.
+        running_sync_loss, running_l1_loss, running_ploss = 0., 0., 0.
         prog_bar = tqdm(enumerate(train_data_loader))
         for step, (x, indiv_mels, mel, gt) in prog_bar:
             model.train()
@@ -214,14 +259,11 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
 
             # Move data to CUDA device
             x = x.to(device)
-            print(x.shape)
             mel = mel.to(device)
             indiv_mels = indiv_mels.to(device)
             gt = gt.to(device)
 
             g = model(indiv_mels, x)
-            print(g.shape)
-            break
 
             if hparams.syncnet_wt > 0.:
                 sync_loss = get_sync_loss(mel, g)
@@ -229,8 +271,9 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
                 sync_loss = 0.
 
             l1loss = recon_loss(g, gt)
+            ploss =  perceptual_loss.calculatePerceptionLoss(g,gt)
 
-            loss = hparams.syncnet_wt * sync_loss + (1 - hparams.syncnet_wt) * l1loss
+            loss = hparams.syncnet_wt * sync_loss + hparams.pl_wt * ploss + (1 - hparams.syncnet_wt - hparams.pl_wt) * l1loss
             loss.backward()
             optimizer.step()
 
@@ -241,6 +284,7 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
             cur_session_steps = global_step - resumed_step
 
             running_l1_loss += l1loss.item()
+            running_ploss += ploss.item()
             if hparams.syncnet_wt > 0.:
                 running_sync_loss += sync_loss.item()
             else:
@@ -254,21 +298,23 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
                 with torch.no_grad():
                     average_sync_loss = eval_model(test_data_loader, global_step, device, model, checkpoint_dir)
 
-                    if average_sync_loss < .75:
+                    if average_sync_loss < 1.1:
                         hparams.set_hparam('syncnet_wt', 0.01) # without image GAN a lesser weight is sufficient
 
-            prog_bar.set_description('L1: {}, Sync Loss: {}'.format(running_l1_loss / (step + 1),
+            prog_bar.set_description('L1: {}, ploss: {}, Sync Loss: {}'.format(running_l1_loss / (step + 1),
+                                                                    running_ploss / (step + 1),
                                                                     running_sync_loss / (step + 1)))
 
         writer.add_scalar("Sync_Loss/train", running_sync_loss/len(train_data_loader), global_epoch)
         writer.add_scalar("L1_Loss/train", running_l1_loss/len(train_data_loader), global_epoch)
+        writer.add_scalar("ploss/train", running_ploss/len(train_data_loader), global_epoch)
         global_epoch += 1
         
 
 def eval_model(test_data_loader, global_step, device, model, checkpoint_dir):
-    eval_steps = 700
+    eval_steps = 200
     print('Evaluating for {} steps'.format(eval_steps))
-    sync_losses, recon_losses = [], []
+    sync_losses, recon_losses, plosses = [], [], []
     step = 0
     while 1:
         for x, indiv_mels, mel, gt in test_data_loader:
@@ -285,17 +331,21 @@ def eval_model(test_data_loader, global_step, device, model, checkpoint_dir):
 
             sync_loss = get_sync_loss(mel, g)
             l1loss = recon_loss(g, gt)
+            ploss =  perceptual_loss.calculatePerceptionLoss(g,gt)
 
             sync_losses.append(sync_loss.item())
             recon_losses.append(l1loss.item())
+            plosses.append(ploss.item())
 
             if step > eval_steps: 
                 averaged_sync_loss = sum(sync_losses) / len(sync_losses)
                 averaged_recon_loss = sum(recon_losses) / len(recon_losses)
+                averaged_ploss = sum(plosses) / len(plosses)
 
-                print('L1: {}, Sync loss: {}'.format(averaged_recon_loss, averaged_sync_loss))
+                print('L1: {}, ploss: {}, Sync loss: {}'.format(averaged_recon_loss, averaged_ploss ,averaged_sync_loss))
                 writer.add_scalar("Sync_Loss/val", averaged_sync_loss, global_step)
                 writer.add_scalar("L1_Loss/val", averaged_recon_loss, global_step)
+                writer.add_scalar("ploss/val", averaged_ploss, global_epoch)
 
                 return averaged_sync_loss
 
@@ -375,7 +425,7 @@ if __name__ == "__main__":
     if not os.path.exists(checkpoint_dir):
         os.mkdir(checkpoint_dir)
 
-    writer = SummaryWriter('runs/full_model_without_disc_exp_temp')
+    writer = SummaryWriter('runs_emo/exp12')
 
     # Train!
     train(device, model, train_data_loader, test_data_loader, optimizer,
