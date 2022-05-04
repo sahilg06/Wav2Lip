@@ -1,4 +1,4 @@
-from os.path import dirname, join, basename, isfile
+from os.path import dirname, join, basename, isfile, isdir
 from tqdm import tqdm
 
 from models import SyncNet_color as SyncNet
@@ -15,6 +15,7 @@ import numpy as np
 from glob import glob
 
 import os, random, cv2, argparse
+import albumentations as A
 from hparams import hparams, get_image_list
 
 parser = argparse.ArgumentParser(description='Code to train the expert lip-sync discriminator')
@@ -29,15 +30,47 @@ args = parser.parse_args()
 
 global_step = 0
 global_epoch = 0
+os.environ['CUDA_VISIBLE_DEVICES']='2'
 use_cuda = torch.cuda.is_available()
 print('use_cuda: {}'.format(use_cuda))
 
 syncnet_T = 5
+emonet_T = 5
 syncnet_mel_step_size = 16
 
 class Dataset(object):
     def __init__(self, split):
-        self.all_videos = get_image_list(args.data_root, split)
+        #self.all_videos = get_image_list(args.data_root, split)
+        self.all_videos = [join(args.data_root, f) for f in os.listdir(args.data_root) if isdir(join(args.data_root, f))]
+        print('Num files: ', len(self.all_videos))
+
+        # to apply same augmentation for all the frames
+        target = {}
+        for i in range(1, emonet_T):
+            target['image' + str(i)] = 'image'
+        
+        self.augments = A.Compose([
+                        A.RandomBrightnessContrast(p=0.2),    
+                        A.RandomGamma(p=0.2),    
+                        A.CLAHE(p=0.2),
+                        A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=50, val_shift_limit=50, p=0.2),  
+                        A.ChannelShuffle(p=0.2), 
+                        A.RGBShift(p=0.2),
+                        A.RandomBrightness(p=0.2),
+                        A.RandomContrast(p=0.2),
+                        A.GaussNoise(var_limit=(10.0, 50.0), p=0.25),
+                    ], additional_targets=target, p=0.8)
+    
+    def augmentVideo(self, video):
+        args = {}
+        args['image'] = video[0, :, :, :]
+        for i in range(1, emonet_T):
+            args['image' + str(i)] = video[i, :, :, :]
+        result = self.augments(**args)
+        video[0, :, :, :] = result['image']
+        for i in range(1, emonet_T):
+            video[i, :, :, :] = result['image' + str(i)]
+        return video
 
     def get_frame_id(self, frame):
         return int(basename(frame).split('.')[0])
@@ -71,6 +104,7 @@ class Dataset(object):
         while 1:
             idx = random.randint(0, len(self.all_videos) - 1)
             vidname = self.all_videos[idx]
+            #print(vidname)
 
             img_names = list(glob(join(vidname, '*.jpg')))
             if len(img_names) <= 3 * syncnet_T:
@@ -122,8 +156,13 @@ class Dataset(object):
                 continue
 
             # H x W x 3 * T
-            x = np.concatenate(window, axis=2) / 255.
-            x = x.transpose(2, 0, 1)
+            window = np.asarray(window)
+            aug_results = self.augmentVideo(window)
+            window = np.split(aug_results, syncnet_T, axis=0)
+
+            x = np.concatenate(window, axis=3) / 255.
+            x = np.squeeze(x, axis=0).transpose(2, 0, 1)
+            # print(x.shape)
             x = x[:, x.shape[1]//2:]
 
             x = torch.FloatTensor(x)
@@ -141,7 +180,7 @@ def cosine_loss(a, v, y):
 def train(device, model, train_data_loader, test_data_loader, optimizer,
           checkpoint_dir=None, checkpoint_interval=None, nepochs=None):
     
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=6)
+    #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=6)
 
     global global_step, global_epoch
     resumed_step = global_step
@@ -154,10 +193,9 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
         for step, (x, mel, y) in prog_bar:
             model.train()
             optimizer.zero_grad()
-
+            
             # Transform data to CUDA device
             x = x.to(device)
-
             mel = mel.to(device)
 
             a, v = model(mel, x)
@@ -185,8 +223,7 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
 
         with torch.no_grad():
             eval_loss = eval_model(test_data_loader, global_step, device, model, checkpoint_dir)
-            scheduler.step(eval_loss)
-            if(eval_loss<=0.26):
+            if(global_epoch % 50 == 0):
                 save_checkpoint(model, optimizer, global_step, checkpoint_dir, global_epoch)
 
         global_epoch += 1
@@ -264,8 +301,13 @@ if __name__ == "__main__":
     if not os.path.exists(checkpoint_dir): os.mkdir(checkpoint_dir)
 
     # Dataset and Dataloader setup
-    train_dataset = Dataset('train')
-    test_dataset = Dataset('val')
+    #train_dataset = Dataset('train')
+    #test_dataset = Dataset('val')
+
+    full_dataset = Dataset('train')
+    train_size = int(0.95 * len(full_dataset))
+    test_size = len(full_dataset) - train_size
+    train_dataset, test_dataset = torch.utils.data.random_split(full_dataset, [train_size, test_size], generator=torch.Generator().manual_seed(42))
 
     train_data_loader = data_utils.DataLoader(
         train_dataset, batch_size=hparams.syncnet_batch_size, shuffle=True,
@@ -289,7 +331,7 @@ if __name__ == "__main__":
     if checkpoint_path is not None:
         load_checkpoint(checkpoint_path, model, optimizer, reset_optimizer=False)
 
-    writer = SummaryWriter('runs/disc_exp5')
+    writer = SummaryWriter('runs/crema-d_disc_exp2_data_aug')
 
     train(device, model, train_data_loader, test_data_loader, optimizer,
           checkpoint_dir=checkpoint_dir,

@@ -14,3 +14,8 @@ evaluation/test_filelists/lr*.txt
 *.gif
 *.webm
 *.mp3
+checkpoints/
+data_root/
+lrs2_preprocessed/
+mvlrs_v1/
+results/

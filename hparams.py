@@ -81,17 +81,22 @@ hparams = HParams(
 	nepochs=200000000000000000,  ### ctrl + c, stop whenever eval loss is consistently greater than train loss for ~10 epochs
 	num_workers=16,
 	checkpoint_interval=3000,
-	eval_interval=3000,
+	eval_interval=500,
     save_optimizer_state=True,
 
     syncnet_wt=0.0, # is initially zero, will be set automatically to 0.03 later. Leads to faster convergence. 
-	syncnet_batch_size=64,
+	syncnet_batch_size=128,
 	syncnet_lr=1e-4,
-	syncnet_eval_interval=10000,
-	syncnet_checkpoint_interval=10000,
+	syncnet_eval_interval=500,
+	syncnet_checkpoint_interval=1000,
 
+    emo_wt=0.001,
+	pl_wt=0.01,
 	disc_wt=0.07,
 	disc_initial_learning_rate=1e-4,
+
+	beta_1=0.999,
+	beta_2=0.999,
 )
 
 

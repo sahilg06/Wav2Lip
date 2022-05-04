@@ -1,4 +1,4 @@
-from os.path import dirname, join, basename, isfile
+from os.path import dirname, join, basename, isfile, isdir
 from tqdm import tqdm
 
 from models import SyncNet_color as SyncNet
@@ -37,7 +37,8 @@ syncnet_mel_step_size = 16
 
 class Dataset(object):
     def __init__(self, split):
-        self.all_videos = get_image_list(args.data_root, split)
+        #self.all_videos = get_image_list(args.data_root, split)
+        self.all_videos = [join(args.data_root, f) for f in os.listdir(args.data_root) if isdir(join(args.data_root, f))]
 
     def get_frame_id(self, frame):
         return int(basename(frame).split('.')[0])
@@ -71,6 +72,7 @@ class Dataset(object):
         while 1:
             idx = random.randint(0, len(self.all_videos) - 1)
             vidname = self.all_videos[idx]
+            #print(vidname)
 
             img_names = list(glob(join(vidname, '*.jpg')))
             if len(img_names) <= 3 * syncnet_T:
@@ -141,7 +143,7 @@ def cosine_loss(a, v, y):
 def train(device, model, train_data_loader, test_data_loader, optimizer,
           checkpoint_dir=None, checkpoint_interval=None, nepochs=None):
     
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=6)
+    #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=6)
 
     global global_step, global_epoch
     resumed_step = global_step
@@ -154,10 +156,9 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
         for step, (x, mel, y) in prog_bar:
             model.train()
             optimizer.zero_grad()
-
+            
             # Transform data to CUDA device
             x = x.to(device)
-
             mel = mel.to(device)
 
             a, v = model(mel, x)
@@ -185,7 +186,6 @@ def train(device, model, train_data_loader, test_data_loader, optimizer,
 
         with torch.no_grad():
             eval_loss = eval_model(test_data_loader, global_step, device, model, checkpoint_dir)
-            scheduler.step(eval_loss)
             if(eval_loss<=0.26):
                 save_checkpoint(model, optimizer, global_step, checkpoint_dir, global_epoch)
 
@@ -264,8 +264,13 @@ if __name__ == "__main__":
     if not os.path.exists(checkpoint_dir): os.mkdir(checkpoint_dir)
 
     # Dataset and Dataloader setup
-    train_dataset = Dataset('train')
-    test_dataset = Dataset('val')
+    #train_dataset = Dataset('train')
+    #test_dataset = Dataset('val')
+
+    full_dataset = Dataset('train')
+    train_size = int(0.95 * len(full_dataset))
+    test_size = len(full_dataset) - train_size
+    train_dataset, test_dataset = torch.utils.data.random_split(full_dataset, [train_size, test_size])
 
     train_data_loader = data_utils.DataLoader(
         train_dataset, batch_size=hparams.syncnet_batch_size, shuffle=True,
@@ -289,7 +294,7 @@ if __name__ == "__main__":
     if checkpoint_path is not None:
         load_checkpoint(checkpoint_path, model, optimizer, reset_optimizer=False)
 
-    writer = SummaryWriter('runs/disc_exp5')
+    writer = SummaryWriter('runs/crema-d_disc_exp1')
 
     train(device, model, train_data_loader, test_data_loader, optimizer,
           checkpoint_dir=checkpoint_dir,
